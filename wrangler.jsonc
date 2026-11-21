@@ -20,8 +20,7 @@
   },
   "kv_namespaces": [
     {
-      "binding": "CHATGPT_KV",
-      "id": "e5d2ae2da9004cbe8e3f5c165aae89aa"
+      "binding": "CHATGPT_KV"
     }
   ]
 }
