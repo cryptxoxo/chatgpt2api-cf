@@ -18,7 +18,7 @@ import {
   tryParseTruncatedToolCall,
 } from './toolcall';
 import type { GenericMessage, SingleCallOptions, ToolDefinition, UpstreamMessage } from './toolcall';
-import { buildAnonRequest } from './translate';
+import { buildAnonRequest, SEARCH_SYSTEM_PROMPT } from './translate';
 
 /** OpenAI chat-completions request extended with the tool-calling fields. */
 export interface WireToolCallRequest {
@@ -146,6 +146,30 @@ function toGenericMessages(messages: any[]): GenericMessage[] {
   return out;
 }
 
+/**
+ * True when the gateway should prepend `SEARCH_SYSTEM_PROMPT` to guide the
+ * upstream model toward searching and verifying facts against retrieved sources.
+ * Skipped when search is disabled, when caller tools are active, or when the
+ * turn answers a supplied `role: "tool"` result (`mustAnswerFromToolResult`).
+ */
+export function shouldInjectSearchPrompt(
+  req: WireToolCallRequest,
+  hasTools: boolean,
+  searchEnabled: boolean
+): boolean {
+  if (!searchEnabled || hasTools) return false;
+  const msgs = req?.messages;
+  if (
+    Array.isArray(msgs) &&
+    msgs.length > 0 &&
+    msgs[msgs.length - 1]?.role === 'tool' &&
+    req.search !== true
+  ) {
+    return false;
+  }
+  return true;
+}
+
 /** Build the tool protocol system message as an upstream frame. */
 function toolProtocolFrame(
   tools: ToolDefinition[],
@@ -165,23 +189,45 @@ function toolProtocolFrame(
   };
 }
 
+/** Build the web-search policy system message as an upstream frame. */
+function searchPolicyFrame(): UpstreamMessage {
+  return {
+    author: { role: 'system' },
+    content: {
+      content_type: 'text',
+      parts: [SEARCH_SYSTEM_PROMPT],
+    },
+  };
+}
+
 /**
  * Build the full anonymous upstream DTO for a request that carries tools.
  *
  * - The conversation comes from req.messages via buildUpstreamMessages
  *   (system messages are preserved; tool results keep author.name). The tool
- *   protocol system message, when tools are present, is inserted at index 0.
+ *   protocol system message, when tools are present, is inserted at index 0;
+ *   otherwise, when web search is active, the search policy system message is
+ *   inserted at index 0.
  * - `prompt` is only the placeholder for buildAnonRequest's default user
  *   message; it is overridden by req.messages whenever any are provided.
  * - When opts.messageContent is set (multimodal), it replaces the content of
- *   the last user message (falling back to the placeholder user message).
+ *   the last user message. A history with no user frame at all (an agent loop
+ *   shaped `assistant(tool_calls)` + `role:"tool"` that carries the screenshot)
+ *   gets one appended carrier user frame instead: the attachment has already
+ *   been uploaded by the caller, and dropping the pointer would answer a
+ *   question about a picture the model never received under a 200.
  * - search/reasoning_effort/service_tier/one_off_model_override/system_hints/
  *   local_function_names/map_search_params and opts.attachmentMimeTypes are
  *   passed through to buildAnonRequest options verbatim.
  */
 export function buildAnonRequestBodyWithTools(
   req: WireToolCallRequest,
-  opts: { prompt: string; messageContent?: Record<string, any>; attachmentMimeTypes?: string[] }
+  opts: {
+    prompt: string;
+    messageContent?: Record<string, any>;
+    attachmentMimeTypes?: string[];
+    injectSearchPrompt?: boolean;
+  }
 ): Record<string, any> {
   const tools = normalizeToolDefinitions(req);
 
@@ -207,19 +253,42 @@ export function buildAnonRequestBodyWithTools(
   // tool_choice:"none" opts out of tool-calling entirely: no protocol frame
   // is prepended (mirrors the handler's hasTools gate and StreamProcessor's
   // toolCallState gate).
-  if (tools.length > 0 && req.tool_choice !== 'none') {
+  const hasToolProtocol = tools.length > 0 && req.tool_choice !== 'none';
+  const useSearchPrompt =
+    opts.injectSearchPrompt !== undefined
+      ? opts.injectSearchPrompt
+      : shouldInjectSearchPrompt(req, false, dto.forceUseSearch === true);
+  if (hasToolProtocol) {
     messages = [toolProtocolFrame(tools, req.tool_choice, req.parallel_tool_calls), ...messages];
+  } else if (useSearchPrompt) {
+    messages = [searchPolicyFrame(), ...messages];
   }
 
   if (opts.messageContent && typeof opts.messageContent === 'object') {
+    let merged = false;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].author.role === 'user') {
         messages[i] = {
           ...messages[i],
           content: opts.messageContent as UpstreamMessage['content'],
         };
+        merged = true;
         break;
       }
+    }
+    // No user frame to carry the attachment. It is already uploaded (and
+    // quota-charged) by the caller, so discarding the pointer would answer a
+    // question about a picture the model never received while the client read
+    // a 200. Append a carrier frame instead, keeping the replayed history and
+    // its frame order untouched.
+    if (!merged) {
+      messages = [
+        ...messages,
+        {
+          author: { role: 'user' },
+          content: opts.messageContent as UpstreamMessage['content'],
+        },
+      ];
     }
   }
 

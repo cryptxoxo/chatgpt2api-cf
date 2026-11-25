@@ -30,6 +30,68 @@ import {
 } from './translate';
 
 /**
+ * Upstream signals collected during a turn for observability and pool health.
+ */
+export interface UpstreamTurnSignals {
+  usedWebSearch: boolean;
+  upstreamModel: string;
+  sourcesCount: number;
+  modelLimitReached: boolean;
+  modelDegraded: boolean;
+}
+
+/**
+ * True when upstream silently downgraded the turn or reported a model quota
+ * limit (e.g. guest device exhausted its 10-message `gpt-6` budget and fell
+ * back to `gpt-6-mini`). Requests that explicitly asked for a `-mini` slug
+ * are not marked degraded unless upstream also emitted `model_limits`.
+ */
+export function isModelDegraded(
+  requestedModel: string,
+  upstreamModel: string,
+  modelLimitReached: boolean
+): boolean {
+  if (modelLimitReached) return true;
+  if (upstreamModel.endsWith('-mini') && requestedModel !== '' && !requestedModel.endsWith('-mini')) {
+    return true;
+  }
+  return false;
+}
+
+function isHistoryEchoAssistantFrame(msg: any): boolean {
+  if (!msg || msg.author?.role !== 'assistant') return false;
+  const status = msg.status;
+  return (
+    (status === 'finished_successfully' || status === 'finished') &&
+    msg.metadata?.message_type !== 'next' &&
+    msg.channel !== 'final'
+  );
+}
+
+function extractUpstreamModel(ev: any): string {
+  if (ev?.type === 'server_ste_metadata' && typeof ev.metadata?.model_slug === 'string' && ev.metadata.model_slug) {
+    return ev.metadata.model_slug;
+  }
+  const msg = ev?.message;
+  if (!msg || isHistoryEchoAssistantFrame(msg)) return '';
+  if (typeof msg.metadata?.model_slug === 'string' && msg.metadata.model_slug) {
+    return msg.metadata.model_slug;
+  }
+  if (typeof msg.metadata?.resolved_model_slug === 'string' && msg.metadata.resolved_model_slug) {
+    return msg.metadata.resolved_model_slug;
+  }
+  return '';
+}
+
+function hasModelLimits(ev: any): boolean {
+  return (
+    ev?.type === 'conversation_detail_metadata' &&
+    Array.isArray(ev.model_limits) &&
+    ev.model_limits.length > 0
+  );
+}
+
+/**
  * True when an upstream message frame belongs to the model's own web search:
  * the assistant addressing the web tool (recipient "web.run") or that tool's
  * reply. Callers never send such frames, so they cannot be history echoes.
@@ -85,6 +147,12 @@ export class StreamProcessor {
   public endedTurn = false;
   /** True once the upstream model ran its own web search during this reply. */
   public usedWebSearch = false;
+  /** Actual upstream model slug observed on live frames or server_ste_metadata. */
+  public upstreamModel = '';
+  /** True when upstream reported `conversation_detail_metadata.model_limits`. */
+  public modelLimitReached = false;
+  /** True once the post-turn `conversation_detail_metadata` frame was parsed. */
+  public sawTurnMetadata = false;
 
   constructor(
     model: string,
@@ -118,6 +186,16 @@ export class StreamProcessor {
     ingestMetadata(this.sources, rawJSON);
 
     const ev = rawJSON;
+    if (ev?.type === 'conversation_detail_metadata') {
+      this.sawTurnMetadata = true;
+    }
+    if (hasModelLimits(ev)) {
+      this.modelLimitReached = true;
+    }
+    const detectedModel = extractUpstreamModel(ev);
+    if (detectedModel) {
+      this.upstreamModel = detectedModel;
+    }
     // A replayed web.run frame is history, not this turn's search. Latch only
     // a live frame: finished echoes have no "next"/"final" marker.
     const searchMsg = ev.message;
@@ -264,6 +342,17 @@ export class StreamProcessor {
     return this.toolCallState ? this.toolCallState.finishReason() : 'stop';
   }
 
+  /** Observability and pool-health signals collected for this upstream turn. */
+  signals(): UpstreamTurnSignals {
+    return {
+      usedWebSearch: this.usedWebSearch,
+      upstreamModel: this.upstreamModel,
+      sourcesCount: this.sources.size,
+      modelLimitReached: this.modelLimitReached,
+      modelDegraded: isModelDegraded(this.model, this.upstreamModel, this.modelLimitReached),
+    };
+  }
+
   /**
    * Convert detection emits into OpenAI chunks. The assistant role frame is
    * emitted once, before the first delta of any kind, so a reply that turns
@@ -400,6 +489,15 @@ async function emitChunk(
  * Shared with the buffered retry reader in src/index.ts.
  */
 export const STREAM_TAIL_GRACE_MS = 250;
+/**
+ * After the live assistant message reports `end_turn`, the upstream still
+ * sends `conversation_detail_metadata` (which carries `model_limits`) and
+ * closes the socket. That trailer lands ~0.4-0.8s after the last content
+ * frame, i.e. after the 250ms typing tail. Keep reading for it so the device
+ * retirement and `model_degraded` signals are not silently dropped for
+ * streaming clients; stop as soon as the event is parsed.
+ */
+export const TURN_METADATA_GRACE_MS = 1500;
 
 /** Sentinel returned by the bounded tail read when the grace window expires. */
 export const READ_TIMEOUT = Symbol('read-timeout');
@@ -413,7 +511,8 @@ export async function pipeOpenAIStream(
   writer: SSEWriter,
   model: string,
   originalReq?: ChatCompletionRequest,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onFinish?: (signals: UpstreamTurnSignals) => void | Promise<void>
 ): Promise<void> {
   const sp = new StreamProcessor(model, originalReq);
   const pendingChunks: ChatCompletionChunk[] = [];
@@ -499,13 +598,19 @@ export async function pipeOpenAIStream(
         }
 
         if (done) break;
-        // Idle-based window: reset AFTER emission so a slow client sink (whose
-        // drain can take longer than the grace period) never consumes the
-        // window and causes an in-window trailing frame to be dropped. The
-        // stream now ends after STREAM_TAIL_GRACE_MS of upstream silence
-        // following the last emitted frame.
+        // The turn's live content is complete, but the upstream still emits
+        // its metadata trailer (including model_limits). Stop as soon as that
+        // frame is parsed; otherwise keep the read window open long enough to
+        // receive it. Reset AFTER emission so a slow client sink never
+        // consumes the window.
         if (sp.endedTurn) {
-          graceDeadline = Date.now() + STREAM_TAIL_GRACE_MS;
+          if (sp.sawTurnMetadata) {
+            try {
+              await reader.cancel();
+            } catch {}
+            break;
+          }
+          graceDeadline = Date.now() + TURN_METADATA_GRACE_MS;
         }
       }
     } finally {
@@ -546,6 +651,10 @@ export async function pipeOpenAIStream(
     await emitChunk(writer, chunk);
   }
 
+  if (onFinish) {
+    await onFinish(sp.signals());
+  }
+
   // Final [DONE] message
   await emitChunk(writer, '[DONE]');
 }
@@ -565,18 +674,31 @@ export async function aggregateNonStream(
 /**
  * aggregateNonStreamWithSignals is aggregateNonStream plus upstream signals
  * that are not part of the OpenAI response body (whether the model ran its
- * own web search), for the tool-contract retry decision.
+ * own web search, actual upstream model, source count, and silent downgrade
+ * detection), for observability headers and pool retirement.
  */
 export async function aggregateNonStreamWithSignals(
   resp: Response,
   model: string,
-  originalReq: ChatCompletionRequest
-): Promise<{ result: ChatCompletionResponse; usedWebSearch: boolean }> {
+  originalReq: ChatCompletionRequest,
+  liveSignals?: UpstreamTurnSignals
+): Promise<{ result: ChatCompletionResponse } & UpstreamTurnSignals> {
   const sources = new Map<string, SearchSource>();
   let usedWebSearch = false;
+  let upstreamModel = '';
+  let modelLimitReached = false;
   let emitted = '';
   let withheld = '';
   let withheldGenui = '';
+
+  const syncLive = () => {
+    if (!liveSignals) return;
+    liveSignals.usedWebSearch = usedWebSearch;
+    liveSignals.upstreamModel = upstreamModel;
+    liveSignals.sourcesCount = sources.size;
+    liveSignals.modelLimitReached = modelLimitReached;
+    liveSignals.modelDegraded = isModelDegraded(model, upstreamModel, modelLimitReached);
+  };
 
   if (resp.body) {
     const reader = resp.body.getReader();
@@ -588,6 +710,13 @@ export async function aggregateNonStreamWithSignals(
         try {
           const parsed = JSON.parse(event.data);
           ingestMetadata(sources, parsed);
+          if (hasModelLimits(parsed)) {
+            modelLimitReached = true;
+          }
+          const detectedModel = extractUpstreamModel(parsed);
+          if (detectedModel) {
+            upstreamModel = detectedModel;
+          }
           const searchMsg = parsed.message;
           const searchStatus = searchMsg?.status;
           const replayedSearch =
@@ -598,6 +727,7 @@ export async function aggregateNonStreamWithSignals(
           if (searchMsg && isWebSearchFrame(searchMsg) && !replayedSearch) {
             usedWebSearch = true;
           }
+          syncLive();
           if (!parsed.message || parsed.message.author?.role !== 'assistant') {
             return;
           }
@@ -659,6 +789,10 @@ export async function aggregateNonStreamWithSignals(
     }
   }
 
+  syncLive();
+  const sourcesCount = sources.size;
+  const modelDegraded = isModelDegraded(model, upstreamModel, modelLimitReached);
+
   // Stop sequences and the completion-token cap are enforced on the assembled
   // reply: upstream honours neither parameter, so the gateway cuts the text and
   // reports the matching finish_reason.
@@ -701,7 +835,7 @@ export async function aggregateNonStreamWithSignals(
         total_tokens: promptTokens + completionTokens,
       },
     } as any;
-    return { result, usedWebSearch };
+    return { result, usedWebSearch, upstreamModel, sourcesCount, modelLimitReached, modelDegraded };
   }
 
   // A cut left nothing but the tail of our own protocol carrier (no call name
@@ -720,5 +854,5 @@ export async function aggregateNonStreamWithSignals(
     answerTokens,
     limitReason ?? 'stop'
   );
-  return { result, usedWebSearch };
+  return { result, usedWebSearch, upstreamModel, sourcesCount, modelLimitReached, modelDegraded };
 }
